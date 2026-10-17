@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2P Drop</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+:root{--bg:#0f1220;--card:#181c2f;--line:#2a3050;--text:#e8ebf7;--sub:#8b93b8;--accent:#5b8cff;--ok:#3ecf8e;--ng:#ff5c7a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;min-height:100vh}
+.wrap{max-width:720px;margin:0 auto;padding:24px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}
+.lead{color:var(--sub);font-size:13px;margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+.card h2{font-size:14px;color:var(--sub);margin:0 0 12px;font-weight:600}
+.code{font-size:34px;font-weight:700;letter-spacing:6px;font-family:ui-monospace,monospace}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input{flex:1;min-width:140px;background:#0c0f1c;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:11px 12px;font-size:16px;text-transform:uppercase;letter-spacing:3px;font-family:ui-monospace,monospace}
+button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:11px 16px;font-size:14px;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--text)}
+button:disabled{opacity:.4;cursor:default}
+#qr{background:#fff;padding:8px;border-radius:8px;display:inline-block;margin-top:12px}
+#qr:empty{display:none}
+.status{display:flex;align-items:center;gap:8px;font-size:14px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--sub)}
+.dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.dot.wait{background:#f5b84b}
+#drop{border:2px dashed var(--line);border-radius:14px;padding:36px 16px;text-align:center;color:var(--sub);cursor:pointer;transition:.15s}
+#drop.over{border-color:var(--accent);background:#1d2340;color:var(--text)}
+#drop.off{opacity:.4;pointer-events:none}
+.item{border-top:1px solid var(--line);padding:12px 0}
+.item:first-child{border-top:0}
+.item .top{display:flex;justify-content:space-between;gap:8px;font-size:14px}
+.item .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item .meta{color:var(--sub);font-size:12px;margin-top:4px;display:flex;justify-content:space-between}
+.bar{height:6px;background:#0c0f1c;border-radius:4px;margin-top:8px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .1s}
+.item.done .bar i{background:var(--ok)}
+.item.err .bar i{background:var(--ng)}
+.item a{color:var(--ok);font-weight:600;text-decoration:none;font-size:13px}
+.empty{color:var(--sub);font-size:13px}
+.tag{font-size:11px;padding:2px 6px;border-radius:6px;background:#0c0f1c;color:var(--sub);margin-right:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>P2P Drop</h1>
+  <p class="lead">サーバーを経由せず、端末同士で直接ファイルを送受信します。</p>
+
+  <div class="card">
+    <h2>あなたのコード</h2>
+    <div class="code" id="myCode">------</div>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" id="copyLink">リンクをコピー</button>
+      <button class="ghost" id="showQr">QRコード</button>
+    </div>
+    <div id="qr"></div>
+  </div>
+
+  <div class="card">
+    <h2>相手に接続</h2>
+    <div class="row">
+      <input id="peerCode" maxlength="6" placeholder="相手のコード" autocomplete="off">
+      <button id="connectBtn">接続</button>
+    </div>
+    <div class="status" style="margin-top:14px">
+      <span class="dot" id="dot"></span><span id="statusText">準備中…</span>
+      <button class="ghost" id="disconnectBtn" style="margin-left:auto;padding:6px 12px;display:none">切断</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>送信</h2>
+    <div id="drop" class="off">ここにファイルをドロップ<br><small>またはクリックして選択（複数可）</small></div>
+    <input type="file" id="fileInput" multiple hidden>
+  </div>
+
+  <div class="card">
+    <h2>転送履歴</h2>
+    <div id="list"><div class="empty">まだ転送はありません</div></div>
+  </div>
+</div>
+
+<script>
+const PREFIX = 'p2pdrop-v1-';
+const CHUNK = 64 * 1024;
+const HIGH = 4 * 1024 * 1024;
+const $ = id => document.getElementById(id);
+
+let peer, conn, myCode;
+let sendQueue = [], sending = false;
+let incoming = null; // {id,name,size,type,chunks,received,el,start}
+
+const genCode = () => {
+  const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from(crypto.getRandomValues(new Uint8Array(6)), b => c[b % c.length]).join('');
+};
+const fmt = b => b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(1) + ' KB' : b < 1073741824 ? (b/1048576).toFixed(1) + ' MB' : (b/1073741824).toFixed(2) + ' GB';
+const shareUrl = () => location.origin + location.pathname + '?c=' + myCode;
+
+function setStatus(text, state) {
+  $('statusText').textContent = text;
+  $('dot').className = 'dot' + (state ? ' ' + state : '');
+  const on = state === 'on';
+  $('drop').classList.toggle('off', !on);
+  $('disconnectBtn').style.display = on ? '' : 'none';
+  $('connectBtn').disabled = on;
+}
+
+function initPeer() {
+  myCode = genCode();
+  peer = new Peer(PREFIX + myCode, { debug: 0 });
+  peer.on('open', () => {
+    $('myCode').textContent = myCode;
+    setStatus('接続待ち（相手にコードを伝えてください）');
+    const c = new URLSearchParams(location.search).get('c');
+    if (c && c.toUpperCase() !== myCode) { $('peerCode').value = c; connect(c); }
+  });
+  peer.on('connection', c => {
+    if (conn && conn.open) { c.on('open', () => c.close()); return; }
+    setup(c);
+  });
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') { peer.destroy(); initPeer(); return; }
+    if (e.type === 'peer-unavailable') setStatus('相手が見つかりません（コードを確認）', '');
+    else setStatus('エラー: ' + e.type, '');
+  });
+  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
+}
+
+function connect(code) {
+  code = code.trim().toUpperCase();
+  if (!/^[A-Z0-9]{6}$/.test(code)) return setStatus('コードは6文字です', '');
+  if (code === myCode) return setStatus('自分のコードには接続できません', '');
+  setStatus('接続中…', 'wait');
+  setup(peer.connect(PREFIX + code, { reliable: true, serialization: 'raw' }));
+}
+
+function setup(c) {
+  conn = c;
+  c.on('open', () => {
+    setStatus('接続済み: ' + c.peer.replace(PREFIX, ''), 'on');
+    c.dataChannel.bufferedAmountLowThreshold = 1024 * 1024;
+  });
+  c.on('data', onData);
+  c.on('close', onClose);
+  c.on('error', onClose);
+}
+
+function onClose() {
+  if (incoming) { markErr(incoming.el, '中断されました'); incoming = null; }
+  sendQueue.forEach(q => markErr(q.el, '未送信')); sendQueue = [];
+  conn = null;
+  setStatus('切断されました（再接続できます）', '');
+}
+
+/* ---------- 受信 ---------- */
+function onData(d) {
+  if (typeof d === 'string') {
+    const m = JSON.parse(d);
+    if (m.t === 'meta') {
+      incoming = { ...m, chunks: [], received: 0, start: performance.now(), el: addItem('受信', m.name, m.size) };
+      if (m.size === 0) finishIncoming();
+    }
+    return;
+  }
+  if (!incoming) return;
+  const buf = d instanceof ArrayBuffer ? d : d.buffer ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength) : d;
+  incoming.chunks.push(buf);
+  incoming.received += buf.byteLength;
+  progress(incoming.el, incoming.received, incoming.size, incoming.start);
+  if (incoming.received >= incoming.size) finishIncoming();
+}
+
+function finishIncoming() {
+  const f = incoming; incoming = null;
+  const blob = new Blob(f.chunks, { type: f.type || 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const el = f.el;
+  el.classList.add('done');
+  el.querySelector('.state').innerHTML = '';
+  const a = document.createElement('a');
+  a.href = url; a.download = f.name; a.textContent = '保存';
+  el.querySelector('.state').appendChild(a);
+}
+
+/* ---------- 送信 ---------- */
+function queueFiles(files) {
+  if (!conn || !conn.open) return;
+  for (const f of files) sendQueue.push({ file: f, el: addItem('送信', f.name, f.size, '待機中') });
+  if (!sending) runQueue();
+}
+
+async function runQueue() {
+  sending = true;
+  while (sendQueue.length && conn && conn.open) {
+    const q = sendQueue.shift();
+    try { await sendFile(q.file, q.el); }
+    catch (e) { markErr(q.el, '失敗'); }
+  }
+  sending = false;
+}
+
+function waitDrain() {
+  const dc = conn.dataChannel;
+  if (dc.bufferedAmount < HIGH && (conn.bufferSize || 0) === 0) return Promise.resolve();
+  return new Promise(res => {
+    const check = () => {
+      if (!conn || !conn.open) return res();
+      if (dc.bufferedAmount < HIGH && (conn.bufferSize || 0) === 0) res();
+      else setTimeout(check, 20);
+    };
+    dc.addEventListener('bufferedamountlow', check, { once: true });
+    setTimeout(check, 50);
+  });
+}
+
+async function sendFile(file, el) {
+  conn.send(JSON.stringify({ t: 'meta', name: file.name, size: file.size, type: file.type }));
+  const start = performance.now();
+  let off = 0;
+  while (off < file.size) {
+    if (!conn || !conn.open) throw new Error('closed');
+    await waitDrain();
+    const buf = await file.slice(off, off + CHUNK).arrayBuffer();
+    conn.send(buf);
+    off += buf.byteLength;
+    progress(el, off, file.size, start);
+  }
+  el.classList.add('done');
+  el.querySelector('.state').textContent = '送信完了';
+}
+
+/* ---------- UI ---------- */
+function addItem(dir, name, size, state = '') {
+  const list = $('list');
+  if (list.querySelector('.empty')) list.innerHTML = '';
+  const el = document.createElement('div');
+  el.className = 'item';
+  el.innerHTML = `<div class="top"><span class="name"><span class="tag">${dir}</span></span><span class="state">${state}</span></div>
+    <div class="bar"><i></i></div><div class="meta"><span class="pct">0% / ${fmt(size)}</span><span class="spd"></span></div>`;
+  el.querySelector('.name').append(name);
+  list.prepend(el);
+  return el;
+}
+function progress(el, done, total, start) {
+  const p = total ? done / total * 100 : 100;
+  el.querySelector('.bar i').style.width = p + '%';
+  el.querySelector('.pct').textContent = `${p.toFixed(0)}% / ${fmt(total)}`;
+  const sec = (performance.now() - start) / 1000;
+  if (sec > 0.2) el.querySelector('.spd').textContent = fmt(done / sec) + '/s';
+}
+function markErr(el, msg) { el.classList.add('err'); el.querySelector('.state').textContent = msg; }
+
+const drop = $('drop');
+drop.onclick = () => $('fileInput').click();
+$('fileInput').onchange = e => { queueFiles(e.target.files); e.target.value = ''; };
+['dragenter','dragover'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); if (ev === 'drop' || !e.relatedTarget) drop.classList.remove('over'); }));
+document.addEventListener('drop', e => queueFiles(e.dataTransfer.files));
+
+$('connectBtn').onclick = () => connect($('peerCode').value);
+$('peerCode').onkeydown = e => { if (e.key === 'Enter') connect(e.target.value); };
+$('disconnectBtn').onclick = () => conn && conn.close();
+$('copyLink').onclick = async () => {
+  try { await navigator.clipboard.writeText(shareUrl()); $('copyLink').textContent = 'コピーしました'; }
+  catch { prompt('このリンクを相手に送ってください', shareUrl()); }
+  setTimeout(() => $('copyLink').textContent = 'リンクをコピー', 1500);
+};
+$('showQr').onclick = () => {
+  const q = $('qr');
+  if (q.innerHTML) { q.innerHTML = ''; return; }
+  new QRCode(q, { text: shareUrl(), width: 160, height: 160 });
+};
+window.addEventListener('beforeunload', e => { if (sending || incoming) { e.preventDefault(); e.returnValue = ''; } });
+
+initPeer();
+</script>
+</body>
+</html>
